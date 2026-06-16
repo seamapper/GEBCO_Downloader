@@ -48,7 +48,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QLabel, QLineEdit, QPushButton, 
                              QFileDialog, QComboBox, QProgressBar, QTextEdit,
                              QGroupBox, QMessageBox, QCheckBox, QSizePolicy, QStyleFactory)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QEvent
 from PyQt6.QtGui import QDesktopServices, QMouseEvent, QPalette, QColor
 from map_widget import MapWidget
 from download_module import BathymetryDownloader
@@ -292,11 +292,13 @@ class MainWindow(QMainWindow):
         self.north_edit = QLineEdit()
         self.north_edit.setPlaceholderText("North")
         
-        # Connect GCS field changes to update map
-        self.west_edit.editingFinished.connect(self.on_geographic_changed)
-        self.south_edit.editingFinished.connect(self.on_geographic_changed)
-        self.east_edit.editingFinished.connect(self.on_geographic_changed)
-        self.north_edit.editingFinished.connect(self.on_geographic_changed)
+        # Commit coordinate edits on Return or when focus leaves the selection group
+        self._coordinate_fields = (
+            self.west_edit, self.south_edit, self.east_edit, self.north_edit
+        )
+        for field in self._coordinate_fields:
+            field.returnPressed.connect(self.on_geographic_changed)
+            field.installEventFilter(self)
         
         # Layout in "+" shape (3x3 grid):
         # Row 0, Col 1: North (top center)
@@ -740,15 +742,12 @@ class MainWindow(QMainWindow):
             self.log_message("ERROR: map_widget is None when trying to trigger load")
             
     def fit_to_extent(self):
-        """Fit map to full service extent - same as initial load with padding."""
+        """Fit map to full service extent."""
         if self.map_widget and self.service_extent:
-            # Use zoom_to_selection to zoom to service extent with padding (same as initial load)
-            # This ensures the same behavior as the initial load: adds 5% padding and adjusts for widget aspect ratio
             self.map_widget.selected_bbox_world = self.service_extent
             self.map_widget.set_selection_validity(True)
             self.selected_bbox = self.service_extent
             self.map_widget.service_extent = self.service_extent
-            # Use zoom_to_selection which will add padding and reload the map
             self.zoom_to_selection(*self.service_extent)
             # Update coordinate display to show the service extent
             self.update_coordinate_display(*self.service_extent, update_map=False)
@@ -996,8 +995,27 @@ class MainWindow(QMainWindow):
         # Update download button state
         self.check_and_update_download_button()
             
+    def eventFilter(self, watched, event):
+        """Commit coordinate edits when focus leaves the selected-area fields."""
+        if (
+            watched in getattr(self, "_coordinate_fields", ())
+            and event.type() == QEvent.Type.FocusOut
+        ):
+            # Defer so tab order between fields is resolved before checking focus
+            QTimer.singleShot(0, self._commit_geographic_if_focus_left_group)
+        return super().eventFilter(watched, event)
+
+    def _commit_geographic_if_focus_left_group(self):
+        """Apply coordinate field values only after focus leaves all four fields."""
+        if self._updating_coordinates:
+            return
+        focus = QApplication.focusWidget()
+        if focus in self._coordinate_fields:
+            return
+        self.on_geographic_changed()
+
     def on_geographic_changed(self):
-        """Handle manual entry in Geographic fields."""
+        """Handle committed manual entry in geographic coordinate fields."""
         if self._updating_coordinates:
             return
             
@@ -1183,6 +1201,30 @@ class MainWindow(QMainWindow):
             self.update_coordinate_display(snapped_west, snapped_south, snapped_east, snapped_north)
             # Button state will be updated by update_coordinate_display (which calls check_and_update_download_button)
             
+    def _get_service_extent(self):
+        """Return the active service extent from the map widget or main window."""
+        if self.map_widget and getattr(self.map_widget, "service_extent", None):
+            return self.map_widget.service_extent
+        return self.service_extent
+
+    @staticmethod
+    def _extents_equal(extent_a, extent_b, tol=1e-5):
+        return all(abs(a - b) < tol for a, b in zip(extent_a, extent_b))
+
+    @staticmethod
+    def _clamp_extent_to_bounds(extent, bounds):
+        """Clamp a view extent to valid geographic/service bounds."""
+        if bounds is None:
+            return extent
+        xmin, ymin, xmax, ymax = extent
+        bxmin, bymin, bxmax, bymax = bounds
+        return (
+            max(xmin, bxmin),
+            max(ymin, bymin),
+            min(xmax, bxmax),
+            min(ymax, bymax),
+        )
+
     def zoom_to_selection(self, xmin, ymin, xmax, ymax):
         """Zoom map to the selected area."""
         if self.map_widget:
@@ -1195,51 +1237,60 @@ class MainWindow(QMainWindow):
                 self.log_message(f"Widget not sized yet ({widget_width}x{widget_height}), retrying zoom_to_selection in 200ms...")
                 QTimer.singleShot(200, lambda: self.zoom_to_selection(xmin, ymin, xmax, ymax))
                 return
-            
-            # Calculate the selected area dimensions
-            selection_width = xmax - xmin
-            selection_height = ymax - ymin
-            
-            # Add 5% padding around the selection
-            padding_x = selection_width * 0.05
-            padding_y = selection_height * 0.05
-            
-            # Start with padded extent
-            padded_xmin = xmin - padding_x
-            padded_ymin = ymin - padding_y
-            padded_xmax = xmax + padding_x
-            padded_ymax = ymax + padding_y
-            
-            padded_width = padded_xmax - padded_xmin
-            padded_height = padded_ymax - padded_ymin
-            
-            if widget_width > 0 and widget_height > 0:
-                widget_aspect = widget_width / widget_height
-                padded_aspect = padded_width / padded_height
-                
-                # Calculate center of padded area
-                center_x = (padded_xmin + padded_xmax) / 2
-                center_y = (padded_ymin + padded_ymax) / 2
-                
-                # Adjust extent to match widget aspect ratio while containing the padded selection
-                if padded_aspect > widget_aspect:
-                    # Padded area is wider than widget - use padded width, adjust height
-                    new_width = padded_width
-                    new_height = new_width / widget_aspect
-                else:
-                    # Padded area is taller than widget - use padded height, adjust width
-                    new_height = padded_height
-                    new_width = new_height * widget_aspect
-                
-                # Create new extent centered on the padded selection
-                new_extent = (
-                    center_x - new_width / 2,
-                    center_y - new_height / 2,
-                    center_x + new_width / 2,
-                    center_y + new_height / 2
-                )
+
+            service_extent = self._get_service_extent()
+            selection = (xmin, ymin, xmax, ymax)
+
+            # Full-world selection: use exact service bounds; widget letterboxes the 2:1 map
+            if service_extent and self._extents_equal(selection, service_extent):
+                new_extent = service_extent
             else:
-                new_extent = (padded_xmin, padded_ymin, padded_xmax, padded_ymax)
+                # Calculate the selected area dimensions
+                selection_width = xmax - xmin
+                selection_height = ymax - ymin
+                
+                # Add 5% padding around the selection
+                padding_x = selection_width * 0.05
+                padding_y = selection_height * 0.05
+                
+                # Start with padded extent
+                padded_xmin = xmin - padding_x
+                padded_ymin = ymin - padding_y
+                padded_xmax = xmax + padding_x
+                padded_ymax = ymax + padding_y
+                
+                padded_width = padded_xmax - padded_xmin
+                padded_height = padded_ymax - padded_ymin
+                
+                if widget_width > 0 and widget_height > 0:
+                    widget_aspect = widget_width / widget_height
+                    padded_aspect = padded_width / padded_height
+                    
+                    # Calculate center of padded area
+                    center_x = (padded_xmin + padded_xmax) / 2
+                    center_y = (padded_ymin + padded_ymax) / 2
+                    
+                    # Adjust extent to match widget aspect ratio while containing the padded selection
+                    if padded_aspect > widget_aspect:
+                        # Padded area is wider than widget - use padded width, adjust height
+                        new_width = padded_width
+                        new_height = new_width / widget_aspect
+                    else:
+                        # Padded area is taller than widget - use padded height, adjust width
+                        new_height = padded_height
+                        new_width = new_height * widget_aspect
+                    
+                    # Create new extent centered on the padded selection
+                    new_extent = (
+                        center_x - new_width / 2,
+                        center_y - new_height / 2,
+                        center_x + new_width / 2,
+                        center_y + new_height / 2
+                    )
+                else:
+                    new_extent = (padded_xmin, padded_ymin, padded_xmax, padded_ymax)
+
+                new_extent = self._clamp_extent_to_bounds(new_extent, service_extent)
             # Set the extent FIRST, then store the selection bbox
             # This ensures the selection bbox is stored with the correct extent context
             self.map_widget.extent = new_extent
