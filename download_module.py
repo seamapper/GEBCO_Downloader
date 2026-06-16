@@ -61,6 +61,20 @@ class BathymetryDownloader(QThread):
     def cancel(self):
         """Cancel the download."""
         self.cancelled = True
+
+    def _export_image_params(self, xmin, ymin, xmax, ymax, width, height):
+        """Build exportImage params for raw data download."""
+        params = {
+            "bbox": f"{xmin},{ymin},{xmax},{ymax}",
+            "size": f"{width},{height}",
+            "format": "tiff",
+            "f": "image",
+            "noData": "true",
+            "interpolation": "RSP_BilinearInterpolation",
+        }
+        if self.bbox_in_4326:
+            params["bboxSR"] = "4326"
+        return params
         
     def run(self):
         """Download data and create GeoTIFF."""
@@ -116,14 +130,7 @@ class BathymetryDownloader(QThread):
                 url = f"{self.base_url}/exportImage"
                 
                 # First, try to get raw TIFF data
-                params = {
-                    "bbox": f"{xmin},{ymin},{xmax},{ymax}",
-                    "size": f"{width},{height}",
-                    "format": "tiff",
-                    "f": "image",
-                    "noData": "true",
-                    "interpolation": "RSP_BilinearInterpolation"
-                }
+                params = self._export_image_params(xmin, ymin, xmax, ymax, width, height)
                 
                 # Don't specify rasterFunction to get raw values
                 # The service should return raw F32 values
@@ -600,14 +607,7 @@ class BathymetryDownloader(QThread):
                 
                 # Download this tile
                 url = f"{self.base_url}/exportImage"
-                params = {
-                    "bbox": f"{tile_xmin},{tile_ymin},{tile_xmax},{tile_ymax}",
-                    "size": f"{tile_width},{tile_height}",
-                    "format": "tiff",
-                    "f": "image",
-                    "noData": "true",
-                    "interpolation": "RSP_BilinearInterpolation"
-                }
+                params = self._export_image_params(tile_xmin, tile_ymin, tile_xmax, tile_ymax, tile_width, tile_height)
                 
                 try:
                     response = requests.get(url, params=params, timeout=300, stream=True)
@@ -739,14 +739,7 @@ class BathymetryDownloader(QThread):
     def _fetch_tid_grid(self, xmin, ymin, xmax, ymax, width, height):
         """Fetch TID grid from TID ImageServer (same bbox and size). Returns 2D array (int8 or float32) or None on error."""
         url = f"{self.tid_url.rstrip('/')}/exportImage"
-        params = {
-            "bbox": f"{xmin},{ymin},{xmax},{ymax}",
-            "size": f"{width},{height}",
-            "format": "tiff",
-            "f": "image",
-            "noData": "true",
-            "interpolation": "RSP_BilinearInterpolation"
-        }
+        params = self._export_image_params(xmin, ymin, xmax, ymax, width, height)
         try:
             if width <= self.tile_max_size and height <= self.tile_max_size:
                 response = requests.get(url, params=params, timeout=300, stream=True)
@@ -782,12 +775,7 @@ class BathymetryDownloader(QThread):
                         by0 = ymax - ty0 * pixel_size_y  # north
                         by1 = ymax - ty1 * pixel_size_y  # south
                         tw, th = tx1 - tx0, ty1 - ty0
-                        resp = requests.get(url, params={
-                            "bbox": f"{bx0},{by0},{bx1},{by1}",
-                            "size": f"{tw},{th}",
-                            "format": "tiff", "f": "image", "noData": "true",
-                            "interpolation": "RSP_BilinearInterpolation"
-                        }, timeout=300, stream=True)
+                        resp = requests.get(url, params=self._export_image_params(bx0, by0, bx1, by1, tw, th), timeout=300, stream=True)
                         resp.raise_for_status()
                         with rasterio.open(BytesIO(resp.content)) as src:
                             tile = src.read(1)

@@ -93,12 +93,13 @@ class MapTileLoader(QThread):
     """Thread for loading map tiles asynchronously."""
     tileLoaded = pyqtSignal(QPixmap, float, float, float, float)  # pixmap, xmin, ymin, xmax, ymax
     
-    def __init__(self, base_url, bbox, size, raster_function="Haxby Percent Clip DRA"):
+    def __init__(self, base_url, bbox, size, raster_function="Haxby Percent Clip DRA", bbox_sr=None):
         super().__init__()
         self.base_url = base_url
         self.bbox = bbox  # (xmin, ymin, xmax, ymax)
         self.size = size  # (width, height)
         self.raster_function = raster_function
+        self.bbox_sr = bbox_sr
         
     def run(self):
         """Load tile from ArcGIS ImageServer."""
@@ -116,6 +117,8 @@ class MapTileLoader(QThread):
                 "format": "png",
                 "f": "image"
             }
+            if self.bbox_sr:
+                params["bboxSR"] = self.bbox_sr
             
             # Add raster function as renderingRule if specified
             if self.raster_function and self.raster_function != "None":
@@ -326,6 +329,7 @@ class MapWidget(QWidget):
         self._original_pixmap_size = None  # Store original pixmap size before scaling for coordinate conversion
         self._scaled_pixmap_size = None  # Store scaled pixmap size (what's actually drawn)
         self._requested_extent = initial_extent  # (west, south, east, north) GCS
+        self.bbox_sr = None  # bboxSR for ImageServer export (e.g. "4326")
         print(f"MapWidget initialized with raster function: {self.raster_function}, show_basemap: {self.show_basemap}, show_hillshade: {self.show_hillshade}, use_blend: {self.use_blend}")
         
         # Set a smaller minimum size to allow 60/40 split (60% of 1200 = 720px)
@@ -544,7 +548,7 @@ class MapWidget(QWidget):
         # Load hillshade layer if enabled (as underlay)
         if self.show_hillshade:
             print("Loading hillshade layer...")
-            self.hillshade_loader = MapTileLoader(self.base_url, requested_extent, size, self.hillshade_raster_function)
+            self.hillshade_loader = MapTileLoader(self.base_url, requested_extent, size, self.hillshade_raster_function, bbox_sr=self.bbox_sr)
             self.hillshade_loader.tileLoaded.connect(self.on_hillshade_loaded)
             self.hillshade_loader.finished.connect(self._check_all_loaders_finished)
             self._active_loaders.append(self.hillshade_loader)
@@ -552,7 +556,7 @@ class MapWidget(QWidget):
         
         # Load bathymetry layer (main layer)
         print("Creating MapTileLoader...")
-        self.loader = MapTileLoader(self.base_url, requested_extent, size, self.raster_function)
+        self.loader = MapTileLoader(self.base_url, requested_extent, size, self.raster_function, bbox_sr=self.bbox_sr)
         print("Connecting signals...")
         self.loader.tileLoaded.connect(self.on_tile_loaded)
         self.loader.finished.connect(self.on_loader_finished)

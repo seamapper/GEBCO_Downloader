@@ -9,7 +9,7 @@ area selection.
 Features:
     - Interactive map widget with area selection and legend
     - World Imagery basemap with bathymetry hillshade underlay
-    - Data sources: GEBCO 2025, GEBCO 2025 TID, and configurable legacy services
+    - Data sources: GEBCO 2025, GEBCO 2025 TID, NCEI Multibeam Mosaic Raw, and configurable legacy services
     - Output data types: Combined Bathymetry & Land, Bathymetry Only, Land Only,
       Direct Measurements Only (TID 10–20), Direct & Unknown Measurement Only (TID 10–20, 44, 70)
     - Multiple output GeoTIFFs per download when using GEBCO 2025
@@ -27,12 +27,7 @@ All rights reserved.
 
 See LICENSE file for full license text.
 """
-
-# __version__ = "2026.1" # First release of the program
-# __version__ = "2026.2" # Cleaned up the program and added licensing information
-#  __version__ = "2026.03" # Added dark mode and light mode for matplotlib windows
-# __version__ = "2026.04" #  Fixed the missing proj.db issue
-__version__ = "2026.05" #  Fixed a timeout issue
+__version__ = "2026.06" 
 
 import sys
 import os
@@ -142,6 +137,7 @@ class MainWindow(QMainWindow):
                 "service_crs": "EPSG:4326",
                 "native_resolution_only": True,
                 "native_pixel_size_degrees": 0.004166666666666667,
+                "show_output_data_types": True,
                 "attribution": "GEBCO Compilation Group (2025) GEBCO 2025 Grid (doi:10.5285/37c52e96-24ea-67ce-e063-7086abc05f29)",
                 "attribution_url": "https://www.bodc.ac.uk/data/published_data_library/catalogue/10.5285/37c52e96-24ea-67ce-e063-7086abc05f29",
             },
@@ -155,9 +151,24 @@ class MainWindow(QMainWindow):
                 "service_crs": "EPSG:4326",
                 "native_resolution_only": True,
                 "native_pixel_size_degrees": 0.004166666666666667,
+                "show_output_data_types": False,
+                "download_filename_prefix": "GEBCO_2025_TID",
                 "attribution": "GEBCO Compilation Group (2025) GEBCO 2025 Grid (doi:10.5285/37c52e96-24ea-67ce-e063-7086abc05f29)",
                 "attribution_url": "https://www.bodc.ac.uk/data/published_data_library/catalogue/10.5285/37c52e96-24ea-67ce-e063-7086abc05f29",
-            }
+            },
+            "NCEI Multibeam Mosaic Raw": {
+                "url": "https://gis.ngdc.noaa.gov/arcgis/rest/services/multibeam_mosaics/multibeam_mosaic_raw/ImageServer",
+                "bathymetry_raster_function": "ColorHillshadeHaxby_8000-0",
+                "hillshade_raster_function": "None",
+                "default_extent": _world_4326,
+                "service_crs": "EPSG:4326",
+                "native_resolution_only": True,
+                "native_pixel_size_degrees": 8.333333333333334e-4,
+                "show_output_data_types": False,
+                "download_filename_prefix": "multibeam_mosaic_raw",
+                "attribution": "NOAA National Centers for Environmental Information (NCEI) Multibeam Mosaic",
+                "attribution_url": "https://gis.ngdc.noaa.gov/arcgis/rest/services/multibeam_mosaics/multibeam_mosaic_raw/ImageServer",
+            },
         }
         self.current_data_source = "GEBCO 2025"
         self.base_url = self.data_sources[self.current_data_source]["url"]
@@ -523,6 +534,7 @@ class MainWindow(QMainWindow):
             self.map_widget.hillshade_raster_function = new_hillshade_raster_function
             self.map_widget.display_url = self.data_sources[self.current_data_source].get("display_url")
             self.map_widget.land_display_url = self.data_sources[self.current_data_source].get("land_display_url")
+            self.map_widget.bbox_sr = self._bbox_sr_for_data_source(self.current_data_source)
             
             # Check if there's a pending selection to preserve
             if hasattr(self, '_pending_selection') and self._pending_selection:
@@ -694,6 +706,7 @@ class MainWindow(QMainWindow):
                 display_url = self.data_sources[self.current_data_source].get("display_url")
                 land_display_url = self.data_sources[self.current_data_source].get("land_display_url")
                 self.map_widget = MapWidget(self.base_url, self.service_extent, raster_function=raster_function, show_basemap=show_basemap, show_hillshade=show_hillshade, use_blend=use_blend, hillshade_raster_function=hillshade_raster_function, display_url=display_url, land_display_url=land_display_url)
+                self.map_widget.bbox_sr = self._bbox_sr_for_data_source(self.current_data_source)
                 self.map_widget.bathymetry_opacity = 1.0  # Full opacity
                 # Sync legend visibility with checkbox state
                 if hasattr(self, 'legend_checkbox'):
@@ -1332,7 +1345,10 @@ class MainWindow(QMainWindow):
             # Bbox is (west, south, east, north) in 4326
             bbox_4326 = bbox
             lon_min, lat_min, lon_max, lat_max = bbox
-            pixel_size_degrees = ds.get("native_pixel_size_degrees", 0.004166666666666667)
+            if self.pixel_size_x is not None:
+                pixel_size_degrees = max(abs(self.pixel_size_x), abs(self.pixel_size_y or self.pixel_size_x))
+            else:
+                pixel_size_degrees = ds.get("native_pixel_size_degrees", 0.004166666666666667)
             pixels_width = int((lon_max - lon_min) / pixel_size_degrees)
             pixels_height = int((lat_max - lat_min) / abs(pixel_size_degrees))
             cell_size_for_filename = "native"
@@ -1392,7 +1408,7 @@ class MainWindow(QMainWindow):
                 return
         
         # Resolve output path(s) for GEBCO 2025 (multiple outputs possible)
-        if native_only and "TID" not in self.current_data_source and output_requests:
+        if native_only and ds.get("show_output_data_types", True) and output_requests:
             if len(output_requests) > 1:
                 if not self.output_directory or not os.path.isdir(self.output_directory):
                     QMessageBox.warning(self, "Output Directory Required", "Select an output directory when saving multiple grids.")
@@ -1436,15 +1452,16 @@ class MainWindow(QMainWindow):
                     if not output_path:
                         return
                 output_requests = [(mode, output_path)]
-        elif native_only and "TID" in self.current_data_source:
-            default_filename = f"GEBCO_2025_TID_{date_time_str}.tif"
+        elif native_only and not ds.get("show_output_data_types", True):
+            prefix = ds.get("download_filename_prefix", "bathymetry")
+            default_filename = f"{prefix}_{date_time_str}.tif"
             if self.output_directory and os.path.isdir(self.output_directory):
                 output_path = os.path.join(self.output_directory, default_filename)
             else:
                 output_path, _ = QFileDialog.getSaveFileName(self, "Save GeoTIFF", default_filename, "GeoTIFF Files (*.tif *.tiff);;All Files (*)")
                 if not output_path:
                     return
-            output_requests = [("combined", output_path)]  # TID is single "combined" style
+            output_requests = [("combined", output_path)]
         elif native_only:
             default_filename = f"GEBCO_2025_{date_time_str}.tif"
             if self.output_directory and os.path.isdir(self.output_directory):
@@ -1787,6 +1804,9 @@ class MainWindow(QMainWindow):
             self.map_widget.raster_function = new_raster_function
             self.map_widget.hillshade_raster_function = new_hillshade_raster_function
             self.map_widget.base_url = self.base_url
+            self.map_widget.display_url = self.data_sources[data_source_name].get("display_url")
+            self.map_widget.land_display_url = self.data_sources[data_source_name].get("land_display_url")
+            self.map_widget.bbox_sr = self._bbox_sr_for_data_source(data_source_name)
             # Update service extent in map widget
             self.map_widget.service_extent = self.service_extent
             # Don't update pixel sizes here - they will be updated in on_service_info_loaded after the new service loads
@@ -1804,13 +1824,18 @@ class MainWindow(QMainWindow):
         # Store selection to restore after map loads (will zoom to it if it overlaps)
         self._pending_selection = saved_selection
     
+    def _bbox_sr_for_data_source(self, data_source_name):
+        """Return bboxSR for ImageServer export when the service uses geographic coordinates."""
+        ds = self.data_sources.get(data_source_name, {})
+        if ds.get("service_crs") == "EPSG:4326" and not ds.get("display_url"):
+            return "4326"
+        return None
+
     def _update_download_mode_visibility(self):
-        """Show Output Data Types groupbox only when GEBCO 2025 (not TID) is selected."""
+        """Show Output Data Types groupbox only for sources that support multiple output types."""
         if hasattr(self, 'output_data_types_group'):
-            is_gebco_2025_not_tid = (
-                self.current_data_source == "GEBCO 2025"
-            )
-            self.output_data_types_group.setVisible(is_gebco_2025_not_tid)
+            ds = self.data_sources.get(self.current_data_source, {})
+            self.output_data_types_group.setVisible(ds.get("show_output_data_types", True))
     
     def _update_attribution(self):
         """Update the attribution text based on the current data source."""
