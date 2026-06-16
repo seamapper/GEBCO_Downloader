@@ -9,7 +9,7 @@ area selection.
 Features:
     - Interactive map widget with area selection and legend
     - World Imagery basemap with bathymetry hillshade underlay
-    - Data sources: GEBCO 2025, GEBCO 2025 TID, NCEI Multibeam Mosaic Raw, and configurable legacy services
+    - Data sources: GEBCO 2025, GEBCO 2025 TID, NCEI Multibeam Mosaic Raw, NCEI Multibeam Mosaic Proc, and configurable legacy services
     - Output data types: Combined Bathymetry & Land, Bathymetry Only, Land Only,
       Direct Measurements Only (TID 10–20), Direct & Unknown Measurement Only (TID 10–20, 44, 70)
     - Multiple output GeoTIFFs per download when using GEBCO 2025
@@ -158,6 +158,7 @@ class MainWindow(QMainWindow):
             },
             "NCEI Multibeam Mosaic Raw": {
                 "url": "https://gis.ngdc.noaa.gov/arcgis/rest/services/multibeam_mosaics/multibeam_mosaic_raw/ImageServer",
+                "land_display_url": "https://gis.ccom.unh.edu/server/rest/services/GEBCO/GEBCO_2025_Land_Grey_GCS/MapServer",
                 "bathymetry_raster_function": "ColorHillshadeHaxby_8000-0",
                 "hillshade_raster_function": "None",
                 "default_extent": _world_4326,
@@ -165,9 +166,27 @@ class MainWindow(QMainWindow):
                 "native_resolution_only": True,
                 "native_pixel_size_degrees": 8.333333333333334e-4,
                 "show_output_data_types": False,
+                "configurable_cell_size_degrees": True,
+                "show_bathymetry_only_notice": True,
                 "download_filename_prefix": "multibeam_mosaic_raw",
                 "attribution": "NOAA National Centers for Environmental Information (NCEI) Multibeam Mosaic",
                 "attribution_url": "https://gis.ngdc.noaa.gov/arcgis/rest/services/multibeam_mosaics/multibeam_mosaic_raw/ImageServer",
+            },
+            "NCEI Multibeam Mosaic Proc": {
+                "url": "https://gis.ngdc.noaa.gov/arcgis/rest/services/multibeam_mosaics/multibeam_mosaic_processed/ImageServer",
+                "land_display_url": "https://gis.ccom.unh.edu/server/rest/services/GEBCO/GEBCO_2025_Land_Grey_GCS/MapServer",
+                "bathymetry_raster_function": "ColorHillshadeHaxby_8000-0",
+                "hillshade_raster_function": "None",
+                "default_extent": _world_4326,
+                "service_crs": "EPSG:4326",
+                "native_resolution_only": True,
+                "native_pixel_size_degrees": 8.333333333333334e-4,
+                "show_output_data_types": False,
+                "configurable_cell_size_degrees": True,
+                "show_bathymetry_only_notice": True,
+                "download_filename_prefix": "multibeam_mosaic_processed",
+                "attribution": "NOAA National Centers for Environmental Information (NCEI) Multibeam Mosaic (Processed)",
+                "attribution_url": "https://gis.ngdc.noaa.gov/arcgis/rest/services/multibeam_mosaics/multibeam_mosaic_processed/ImageServer",
             },
         }
         self.current_data_source = "GEBCO 2025"
@@ -375,6 +394,23 @@ class MainWindow(QMainWindow):
         output_data_types_layout.addWidget(self.download_mode_container)
         self.output_data_types_group.setLayout(output_data_types_layout)
         output_layout.addWidget(self.output_data_types_group)
+
+        # Cell size in degrees (NCEI multibeam and similar sources)
+        self.cell_size_degrees_container = QWidget()
+        cell_size_deg_layout = QHBoxLayout(self.cell_size_degrees_container)
+        cell_size_deg_layout.setContentsMargins(0, 0, 0, 0)
+        cell_size_deg_layout.addWidget(QLabel("Cell Size (deg):"))
+        self.cell_size_degrees_edit = QLineEdit()
+        self.cell_size_degrees_edit.setPlaceholderText("Service native resolution")
+        cell_size_deg_layout.addWidget(self.cell_size_degrees_edit)
+        output_layout.addWidget(self.cell_size_degrees_container)
+        self.cell_size_degrees_edit.editingFinished.connect(self._on_cell_size_degrees_changed)
+
+        self.bathymetry_only_notice_label = QLabel(
+            "Download is bathymetry only; the land layer is for map display reference."
+        )
+        self.bathymetry_only_notice_label.setWordWrap(True)
+        output_layout.addWidget(self.bathymetry_only_notice_label)
         
         # Pixel count display at the bottom
         self.pixel_count_label = QLabel("Pixels: --")
@@ -384,8 +420,8 @@ class MainWindow(QMainWindow):
         output_group.setLayout(output_layout)
         right_layout.addWidget(output_group)
         
-        # Show download mode options only for GEBCO 2025 (not TID)
-        self._update_download_mode_visibility()
+        # Show/hide output option controls based on data source
+        self._update_output_options_visibility()
         
         # Output directory selection
         output_dir_btn = QPushButton("Select Output Directory")
@@ -501,7 +537,10 @@ class MainWindow(QMainWindow):
         self.pixel_size_x = pixel_size_x
         self.pixel_size_y = pixel_size_y
         if ds.get("native_resolution_only"):
-            self._set_native_cell_size_only()
+            if ds.get("configurable_cell_size_degrees"):
+                self._set_cell_size_degrees_default(force=self._data_source_changing)
+            else:
+                self._set_native_cell_size_only()
         elif pixel_size_x is not None and pixel_size_y is not None:
             base_cell_size = max(abs(pixel_size_x), abs(pixel_size_y))
             self.update_cell_size_options(base_cell_size, force_highest_resolution=self._data_source_changing)
@@ -887,8 +926,8 @@ class MainWindow(QMainWindow):
         try:
             west, south, east, north = bbox
             ds = self.data_sources.get(self.current_data_source, {})
-            if ds.get("native_resolution_only"):
-                deg_per_pixel = ds.get("native_pixel_size_degrees", 0.004166666666666667)
+            if ds.get("native_resolution_only") or ds.get("configurable_cell_size_degrees"):
+                deg_per_pixel = self._get_degrees_per_pixel_for_output()
                 pixels_width = int((east - west) / deg_per_pixel)
                 pixels_height = int((north - south) / abs(deg_per_pixel))
             else:
@@ -938,6 +977,75 @@ class MainWindow(QMainWindow):
             if self.map_widget:
                 self.map_widget.set_selection_validity(True)  # Default to valid on error
     
+    def _get_native_pixel_size_degrees(self):
+        """Return native cell size in degrees from service info or data source config."""
+        ds = self.data_sources.get(self.current_data_source, {})
+        if self.pixel_size_x is not None:
+            return max(abs(self.pixel_size_x), abs(self.pixel_size_y or self.pixel_size_x))
+        return ds.get("native_pixel_size_degrees", 0.004166666666666667)
+
+    @staticmethod
+    def _format_cell_size_degrees(value):
+        """Format a cell size in degrees for display in the UI."""
+        return f"{value:.12g}"
+
+    def _get_output_cell_size_degrees(self):
+        """Return the user-selected cell size in degrees, or native if unset/invalid."""
+        if hasattr(self, "cell_size_degrees_edit") and self.cell_size_degrees_container.isVisible():
+            text = self.cell_size_degrees_edit.text().strip()
+            if text:
+                try:
+                    value = float(text)
+                    if value > 0:
+                        return value
+                except ValueError:
+                    pass
+        return self._get_native_pixel_size_degrees()
+
+    def _get_degrees_per_pixel_for_output(self):
+        """Return degrees-per-pixel used for output grid sizing and downloads."""
+        ds = self.data_sources.get(self.current_data_source, {})
+        if ds.get("configurable_cell_size_degrees"):
+            return self._get_output_cell_size_degrees()
+        if ds.get("native_resolution_only"):
+            return self._get_native_pixel_size_degrees()
+        return ds.get("native_pixel_size_degrees", 0.004166666666666667)
+
+    def _set_cell_size_degrees_default(self, force=False):
+        """Set Cell Size (deg) field to the service native resolution."""
+        if not hasattr(self, "cell_size_degrees_edit"):
+            return
+        if force or not self.cell_size_degrees_edit.text().strip():
+            self.cell_size_degrees_edit.setText(
+                self._format_cell_size_degrees(self._get_native_pixel_size_degrees())
+            )
+        if hasattr(self, "selected_bbox") and self.selected_bbox:
+            xmin, ymin, xmax, ymax = self.selected_bbox
+            self.update_coordinate_display(xmin, ymin, xmax, ymax, update_map=False)
+
+    def _on_cell_size_degrees_changed(self):
+        """Handle manual entry of cell size in degrees."""
+        ds = self.data_sources.get(self.current_data_source, {})
+        if not ds.get("configurable_cell_size_degrees"):
+            return
+        text = self.cell_size_degrees_edit.text().strip()
+        if not text:
+            self._set_cell_size_degrees_default(force=True)
+            return
+        try:
+            value = float(text)
+            if value <= 0:
+                raise ValueError("Cell size must be positive")
+            self.cell_size_degrees_edit.setText(self._format_cell_size_degrees(value))
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Cell Size", "Enter a positive numeric cell size in degrees.")
+            self._set_cell_size_degrees_default(force=True)
+            return
+        if hasattr(self, "selected_bbox") and self.selected_bbox:
+            xmin, ymin, xmax, ymax = self.selected_bbox
+            self.update_coordinate_display(xmin, ymin, xmax, ymax, update_map=False)
+        self.check_and_update_download_button()
+
     def _set_native_cell_size_only(self):
         """Set cell size dropdown to single 'Native' option (for sources with native_resolution_only)."""
         if not hasattr(self, 'cell_size_combo'):
@@ -1091,8 +1199,8 @@ class MainWindow(QMainWindow):
         # Calculate expected number of pixels (bbox is in GCS: west, south, east, north)
         try:
             ds = self.data_sources.get(self.current_data_source, {})
-            if ds.get("native_resolution_only"):
-                deg_per_pixel = ds.get("native_pixel_size_degrees", 0.004166666666666667)
+            if ds.get("native_resolution_only") or ds.get("configurable_cell_size_degrees"):
+                deg_per_pixel = self._get_degrees_per_pixel_for_output()
                 pixels_width = int((east - west) / deg_per_pixel)
                 pixels_height = int((north - south) / abs(deg_per_pixel))
                 cell_size_label = "native"
@@ -1156,9 +1264,8 @@ class MainWindow(QMainWindow):
         ds = self.data_sources.get(self.current_data_source, {})
         
         # Determine pixel size in degrees
-        if ds.get("native_resolution_only"):
-            # Use native pixel size
-            pixel_size_degrees = ds.get("native_pixel_size_degrees", 0.004166666666666667)
+        if ds.get("native_resolution_only") or ds.get("configurable_cell_size_degrees"):
+            pixel_size_degrees = self._get_degrees_per_pixel_for_output()
         else:
             # Convert cell size from meters to degrees (approximate)
             ct = self.cell_size_combo.currentText() if hasattr(self, 'cell_size_combo') else ""
@@ -1252,58 +1359,53 @@ class MainWindow(QMainWindow):
                 return
 
             service_extent = self._get_service_extent()
-            selection = (xmin, ymin, xmax, ymax)
 
-            # Full-world selection: use exact service bounds; widget letterboxes the 2:1 map
-            if service_extent and self._extents_equal(selection, service_extent):
-                new_extent = service_extent
-            else:
-                # Calculate the selected area dimensions
-                selection_width = xmax - xmin
-                selection_height = ymax - ymin
-                
-                # Add 5% padding around the selection
-                padding_x = selection_width * 0.05
-                padding_y = selection_height * 0.05
-                
-                # Start with padded extent
-                padded_xmin = xmin - padding_x
-                padded_ymin = ymin - padding_y
-                padded_xmax = xmax + padding_x
-                padded_ymax = ymax + padding_y
-                
-                padded_width = padded_xmax - padded_xmin
-                padded_height = padded_ymax - padded_ymin
-                
-                if widget_width > 0 and widget_height > 0:
-                    widget_aspect = widget_width / widget_height
-                    padded_aspect = padded_width / padded_height
-                    
-                    # Calculate center of padded area
-                    center_x = (padded_xmin + padded_xmax) / 2
-                    center_y = (padded_ymin + padded_ymax) / 2
-                    
-                    # Adjust extent to match widget aspect ratio while containing the padded selection
-                    if padded_aspect > widget_aspect:
-                        # Padded area is wider than widget - use padded width, adjust height
-                        new_width = padded_width
-                        new_height = new_width / widget_aspect
-                    else:
-                        # Padded area is taller than widget - use padded height, adjust width
-                        new_height = padded_height
-                        new_width = new_height * widget_aspect
-                    
-                    # Create new extent centered on the padded selection
-                    new_extent = (
-                        center_x - new_width / 2,
-                        center_y - new_height / 2,
-                        center_x + new_width / 2,
-                        center_y + new_height / 2
-                    )
+            # Calculate the selected area dimensions
+            selection_width = xmax - xmin
+            selection_height = ymax - ymin
+
+            # Add 5% padding around the selection
+            padding_x = selection_width * 0.05
+            padding_y = selection_height * 0.05
+
+            # Start with padded extent
+            padded_xmin = xmin - padding_x
+            padded_ymin = ymin - padding_y
+            padded_xmax = xmax + padding_x
+            padded_ymax = ymax + padding_y
+
+            padded_width = padded_xmax - padded_xmin
+            padded_height = padded_ymax - padded_ymin
+
+            if widget_width > 0 and widget_height > 0:
+                widget_aspect = widget_width / widget_height
+                padded_aspect = padded_width / padded_height
+
+                # Calculate center of padded area
+                center_x = (padded_xmin + padded_xmax) / 2
+                center_y = (padded_ymin + padded_ymax) / 2
+
+                # Adjust extent to match widget aspect ratio while containing the padded selection
+                if padded_aspect > widget_aspect:
+                    # Padded area is wider than widget - use padded width, adjust height
+                    new_width = padded_width
+                    new_height = new_width / widget_aspect
                 else:
-                    new_extent = (padded_xmin, padded_ymin, padded_xmax, padded_ymax)
+                    # Padded area is taller than widget - use padded height, adjust width
+                    new_height = padded_height
+                    new_width = new_height * widget_aspect
 
-                new_extent = self._clamp_extent_to_bounds(new_extent, service_extent)
+                # Create new extent centered on the padded selection
+                new_extent = (
+                    center_x - new_width / 2,
+                    center_y - new_height / 2,
+                    center_x + new_width / 2,
+                    center_y + new_height / 2
+                )
+            else:
+                new_extent = (padded_xmin, padded_ymin, padded_xmax, padded_ymax)
+
+            new_extent = self._clamp_extent_to_bounds(new_extent, service_extent)
             # Set the extent FIRST, then store the selection bbox
             # This ensures the selection bbox is stored with the correct extent context
             self.map_widget.extent = new_extent
@@ -1345,13 +1447,13 @@ class MainWindow(QMainWindow):
             # Bbox is (west, south, east, north) in 4326
             bbox_4326 = bbox
             lon_min, lat_min, lon_max, lat_max = bbox
-            if self.pixel_size_x is not None:
-                pixel_size_degrees = max(abs(self.pixel_size_x), abs(self.pixel_size_y or self.pixel_size_x))
-            else:
-                pixel_size_degrees = ds.get("native_pixel_size_degrees", 0.004166666666666667)
+            pixel_size_degrees = self._get_degrees_per_pixel_for_output()
             pixels_width = int((lon_max - lon_min) / pixel_size_degrees)
             pixels_height = int((lat_max - lat_min) / abs(pixel_size_degrees))
-            cell_size_for_filename = "native"
+            if ds.get("configurable_cell_size_degrees"):
+                cell_size_for_filename = self._format_cell_size_degrees(pixel_size_degrees).replace(".", "p")
+            else:
+                cell_size_for_filename = "native"
         else:
             xmin, ymin, xmax, ymax = bbox
             try:
@@ -1454,7 +1556,10 @@ class MainWindow(QMainWindow):
                 output_requests = [(mode, output_path)]
         elif native_only and not ds.get("show_output_data_types", True):
             prefix = ds.get("download_filename_prefix", "bathymetry")
-            default_filename = f"{prefix}_{date_time_str}.tif"
+            if ds.get("configurable_cell_size_degrees"):
+                default_filename = f"{prefix}_{cell_size_for_filename}deg_{date_time_str}.tif"
+            else:
+                default_filename = f"{prefix}_{date_time_str}.tif"
             if self.output_directory and os.path.isdir(self.output_directory):
                 output_path = os.path.join(self.output_directory, default_filename)
             else:
@@ -1812,8 +1917,10 @@ class MainWindow(QMainWindow):
             # Don't update pixel sizes here - they will be updated in on_service_info_loaded after the new service loads
             # This ensures we get the correct pixel sizes for the new data source
         
-        # Show/hide download mode options (Combined/Bathymetry Only/Land Only) for GEBCO 2025 only
-        self._update_download_mode_visibility()
+        # Show/hide output option controls based on data source
+        self._update_output_options_visibility()
+        if self.data_sources[data_source_name].get("configurable_cell_size_degrees"):
+            self._set_cell_size_degrees_default(force=True)
         
         # Update attribution text
         self._update_attribution()
@@ -1831,11 +1938,15 @@ class MainWindow(QMainWindow):
             return "4326"
         return None
 
-    def _update_download_mode_visibility(self):
-        """Show Output Data Types groupbox only for sources that support multiple output types."""
-        if hasattr(self, 'output_data_types_group'):
-            ds = self.data_sources.get(self.current_data_source, {})
+    def _update_output_options_visibility(self):
+        """Show/hide output controls based on the active data source."""
+        ds = self.data_sources.get(self.current_data_source, {})
+        if hasattr(self, "output_data_types_group"):
             self.output_data_types_group.setVisible(ds.get("show_output_data_types", True))
+        if hasattr(self, "cell_size_degrees_container"):
+            self.cell_size_degrees_container.setVisible(ds.get("configurable_cell_size_degrees", False))
+        if hasattr(self, "bathymetry_only_notice_label"):
+            self.bathymetry_only_notice_label.setVisible(ds.get("show_bathymetry_only_notice", False))
     
     def _update_attribution(self):
         """Update the attribution text based on the current data source."""

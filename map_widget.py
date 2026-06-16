@@ -335,6 +335,10 @@ class MapWidget(QWidget):
         # Set a smaller minimum size to allow 60/40 split (60% of 1200 = 720px)
         self.setMinimumSize(600, 400)
         self.setMouseTracking(True)
+        self.setAutoFillBackground(True)
+        palette = self.palette()
+        palette.setColor(self.backgroundRole(), QColor(0, 0, 0))
+        self.setPalette(palette)
         
         # Don't load map immediately - wait for widget to be shown and sized
         # The load will be triggered by showEvent or when explicitly called
@@ -398,6 +402,18 @@ class MapWidget(QWidget):
         
         if all_finished:
             self._loading = False
+
+    def _start_land_basemap_loader(self, requested_extent, size):
+        """Load GEBCO land MapServer layer as an underlay when configured."""
+        if not self.land_display_url:
+            return
+        print("Loading land basemap (GCS)...")
+        self.basemap_loader = MapServerLoader(self.land_display_url, requested_extent, size, transparent=False)
+        self.basemap_loader.statusMessage.connect(self.statusMessage.emit)
+        self.basemap_loader.tileLoaded.connect(lambda pixmap, *args: self.on_basemap_loaded(pixmap))
+        self.basemap_loader.finished.connect(self._check_all_loaders_finished)
+        self._active_loaders.append(self.basemap_loader)
+        self.basemap_loader.start()
     
     def load_map(self):
         """Load map for current extent."""
@@ -513,16 +529,7 @@ class MapWidget(QWidget):
         
         # When display_url is set (e.g. GEBCO MapServer), use GCS extent: land basemap + display layer
         if self.display_url:
-            if self.land_display_url:
-                print("Loading land basemap (GCS)...")
-                # Land layer: opaque (transparent=False) so it's always visible
-                self.basemap_loader = MapServerLoader(self.land_display_url, requested_extent, size, transparent=False)
-                self.basemap_loader.statusMessage.connect(self.statusMessage.emit)
-                # MapServerLoader emits (pixmap, west, south, east, north); extract just pixmap
-                self.basemap_loader.tileLoaded.connect(lambda pixmap, *args: self.on_basemap_loaded(pixmap))
-                self.basemap_loader.finished.connect(self._check_all_loaders_finished)
-                self._active_loaders.append(self.basemap_loader)
-                self.basemap_loader.start()
+            self._start_land_basemap_loader(requested_extent, size)
             print("Loading display layer (GCS)...")
             # Bathymetry layer: transparent (transparent=True) so land shows through
             self.loader = MapServerLoader(self.display_url, requested_extent, size, transparent=True)
@@ -536,7 +543,10 @@ class MapWidget(QWidget):
             print("=" * 50)
             return
         
-        # Load basemap if enabled (non-display_url path)
+        # ImageServer path (e.g. NCEI multibeam): optional land underlay + raster function overlay
+        self._start_land_basemap_loader(requested_extent, size)
+
+        # Load basemap if enabled (World Imagery tiles)
         if self.show_basemap:
             print("Loading basemap...")
             self.basemap_loader = BasemapLoader(requested_extent, size)
@@ -592,6 +602,7 @@ class MapWidget(QWidget):
             else:
                 self.basemap_pixmap = pixmap
             print(f"Basemap loaded: {self.basemap_pixmap.width()}x{self.basemap_pixmap.height()}")
+            self._sync_basemap_to_current_pixmap()
             self.update()  # Trigger repaint
             
     def on_hillshade_loaded(self, pixmap, xmin, ymin, xmax, ymax):
@@ -700,6 +711,7 @@ class MapWidget(QWidget):
                     self.extent = server_extent
                     self._requested_extent = server_extent
             print(f"Setting current_pixmap, isNull: {self.current_pixmap.isNull()}, size: {self.current_pixmap.width()}x{self.current_pixmap.height()}")
+            self._sync_basemap_to_current_pixmap()
             print(f"Calling update() to repaint widget")
             
             # CRITICAL: Force immediate repaint to ensure selection box is redrawn with new pixmap size
@@ -727,32 +739,86 @@ class MapWidget(QWidget):
         else:
             print("Error: Received null pixmap from tile loader")
             
+    def _sync_basemap_to_current_pixmap(self):
+        """Keep land basemap aligned with the bathymetry layer dimensions."""
+        if self.basemap_pixmap.isNull() or self.current_pixmap.isNull():
+            return
+        if self.basemap_pixmap.size() != self.current_pixmap.size():
+            self.basemap_pixmap = self.basemap_pixmap.scaled(
+                self.current_pixmap.size(),
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+
+    def _extent_for_conversion(self):
+        """Return the geographic extent used for screen/world coordinate conversion."""
+        if hasattr(self, '_requested_extent') and self._requested_extent is not None:
+            return self._requested_extent
+        return self.extent
+
+    def _pixmap_draw_rect(self):
+        """Return the on-screen rectangle where the map pixmap is painted (centered)."""
+        widget_rect = self.rect()
+        if self.current_pixmap.isNull():
+            return widget_rect
+        pr = self.current_pixmap.rect()
+        x = (widget_rect.width() - pr.width()) // 2
+        y = (widget_rect.height() - pr.height()) // 2
+        return QRect(x, y, pr.width(), pr.height())
+
+    def _geographic_data_rect(self):
+        """
+        Return the screen rectangle where geographic coordinates map linearly.
+
+        ArcGIS exports letterbox when geographic aspect differs from image aspect
+        (e.g. global 2:1 extent in a ~4:3 widget), leaving transparent margins.
+        """
+        map_rect = self._pixmap_draw_rect()
+        if map_rect.isEmpty():
+            return map_rect
+
+        extent = self._extent_for_conversion()
+        if extent is None:
+            return map_rect
+
+        xmin, ymin, xmax, ymax = extent
+        geo_w = xmax - xmin
+        geo_h = ymax - ymin
+        if geo_w <= 0 or geo_h <= 0:
+            return map_rect
+
+        geo_aspect = geo_w / geo_h
+        pix_aspect = map_rect.width() / map_rect.height()
+
+        if geo_aspect > pix_aspect:
+            draw_w = map_rect.width()
+            draw_h = int(round(map_rect.width() / geo_aspect))
+            x = map_rect.left()
+            y = map_rect.top() + (map_rect.height() - draw_h) // 2
+        else:
+            draw_h = map_rect.height()
+            draw_w = int(round(map_rect.height() * geo_aspect))
+            x = map_rect.left() + (map_rect.width() - draw_w) // 2
+            y = map_rect.top()
+
+        return QRect(x, y, draw_w, draw_h)
+
     def screen_to_world(self, point):
         """Convert screen coordinates to world coordinates."""
         if self.current_pixmap.isNull():
             return None
-            
-        pixmap_rect = self.current_pixmap.rect()
-        pixmap_rect.moveCenter(self.rect().center())
-        
-        if not pixmap_rect.contains(point):
+
+        data_rect = self._geographic_data_rect()
+        if not data_rect.contains(point):
             return None
-            
-        # Calculate relative position in pixmap
-        rel_x = (point.x() - pixmap_rect.left()) / pixmap_rect.width()
-        rel_y = (point.y() - pixmap_rect.top()) / pixmap_rect.height()
-        
-        # CRITICAL: Always use _requested_extent if available, as it matches what was actually requested and displayed
-        # This ensures coordinate conversion is accurate, especially on first load
-        # If _requested_extent is not set, use self.extent, but this should only happen before first map load
-        if hasattr(self, '_requested_extent') and self._requested_extent is not None:
-            xmin, ymin, xmax, ymax = self._requested_extent
-        elif self.extent:
-            # Fallback to current extent if _requested_extent not set yet
-            xmin, ymin, xmax, ymax = self.extent
-        else:
-            # No extent available - cannot convert
+
+        rel_x = (point.x() - data_rect.left()) / data_rect.width()
+        rel_y = (point.y() - data_rect.top()) / data_rect.height()
+
+        extent = self._extent_for_conversion()
+        if extent is None:
             return None
+        xmin, ymin, xmax, ymax = extent
         
         world_x = xmin + rel_x * (xmax - xmin)
         world_y = ymax - rel_y * (ymax - ymin)  # Y is inverted in screen coordinates
@@ -763,59 +829,17 @@ class MapWidget(QWidget):
         """Convert world coordinates to screen coordinates."""
         if self.current_pixmap.isNull():
             return None
-        
-        widget_rect = self.rect()
-        widget_width = widget_rect.width()
-        widget_height = widget_rect.height()
-        
-        # CRITICAL FIX: Use widget size for coordinate conversion when pixmap size doesn't match
-        # This ensures the selection box is drawn correctly even when the pixmap hasn't been updated yet
-        # Get the actual pixmap rect (what's actually drawn)
-        pixmap_rect = self.current_pixmap.rect()
-        pixmap_width = pixmap_rect.width()
-        pixmap_height = pixmap_rect.height()
-        
-        # If pixmap size matches widget size, use pixmap size
-        # Otherwise, use widget size (pixmap will be scaled to fit widget)
-        if pixmap_width == widget_width and pixmap_height == widget_height:
-            # Pixmap matches widget - use pixmap size
-            target_width = pixmap_width
-            target_height = pixmap_height
-            x = 0
-            y = 0
-        else:
-            # Pixmap doesn't match widget - use widget size (pixmap will be centered/scaled)
-            # Center the pixmap in the widget (EXACT same logic as in paintEvent)
-            x = (widget_width - pixmap_width) // 2
-            y = (widget_height - pixmap_height) // 2
-            # Use widget size for coordinate conversion (pixmap will be scaled to fit)
-            target_width = widget_width
-            target_height = widget_height
-            x = 0
-            y = 0
-        
-        # Create the target rect that matches paintEvent exactly
-        target_rect = QRect(x, y, target_width, target_height)
-        
-        # Use _requested_extent if available, as it matches what was actually requested and displayed
-        # This ensures coordinate conversion is accurate and consistent with screen_to_world
-        if hasattr(self, '_requested_extent') and self._requested_extent is not None:
-            xmin, ymin, xmax, ymax = self._requested_extent
-        elif self.extent:
-            # Fallback to current extent if _requested_extent not set yet
-            xmin, ymin, xmax, ymax = self.extent
-        else:
-            # No extent available - cannot convert
+
+        target_rect = self._geographic_data_rect()
+        extent = self._extent_for_conversion()
+        if extent is None:
             return None
+        xmin, ymin, xmax, ymax = extent
         
         # Calculate relative position within the extent (0.0 to 1.0)
-        # This is independent of pixmap size - it's purely based on geographic extent
         rel_x = (world_x - xmin) / (xmax - xmin) if (xmax - xmin) != 0 else 0
         rel_y = (ymax - world_y) / (ymax - ymin) if (ymax - ymin) != 0 else 0  # Y is inverted
         
-        # Convert to screen coordinates using the target rect (same as paintEvent)
-        # The target rect represents where the geographic extent is drawn on screen
-        # CRITICAL: This must use the same rect calculation as paintEvent
         screen_x = target_rect.left() + rel_x * target_rect.width()
         screen_y = target_rect.top() + rel_y * target_rect.height()
         
@@ -823,8 +847,7 @@ class MapWidget(QWidget):
         widget_rect = self.rect()
         clamped_x = max(0, min(int(screen_x), widget_rect.width() - 1))
         clamped_y = max(0, min(int(screen_y), widget_rect.height() - 1))
-        result = QPoint(clamped_x, clamped_y)
-        return result
+        return QPoint(clamped_x, clamped_y)
         
     def get_selection_bbox(self):
         """Get the bounding box of the current selection in world coordinates."""
@@ -928,17 +951,19 @@ class MapWidget(QWidget):
             self.pan_end = current_pos  # Track current position for pan line
             delta = current_pos - self.pan_start
             
-            # Convert screen delta to world delta
-            pixmap_rect = self.current_pixmap.rect()
-            pixmap_rect.moveCenter(self.rect().center())
+            # Convert screen delta to world delta using the geographic data rect
+            data_rect = self._geographic_data_rect()
             
-            if not pixmap_rect.isNull():
-                xmin, ymin, xmax, ymax = self.extent
+            if not data_rect.isNull():
+                extent = self._extent_for_conversion()
+                if extent is None:
+                    return
+                xmin, ymin, xmax, ymax = extent
                 world_width = xmax - xmin
                 world_height = ymax - ymin
                 
-                rel_delta_x = -delta.x() / pixmap_rect.width() * world_width
-                rel_delta_y = delta.y() / pixmap_rect.height() * world_height
+                rel_delta_x = -delta.x() / data_rect.width() * world_width
+                rel_delta_y = delta.y() / data_rect.height() * world_height
                 
                 # Update extent
                 self.extent = (
@@ -1053,6 +1078,7 @@ class MapWidget(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
         widget_rect = self.rect()
+        painter.fillRect(widget_rect, QColor(0, 0, 0))
         
         # Draw basemap first (if available) - bottom layer
         # Draw if show_basemap is True OR if land_display_url is set (land layer for GEBCO)
@@ -1063,9 +1089,6 @@ class MapWidget(QWidget):
             y = (widget_rect.height() - basemap_rect.height()) // 2
             target_rect = QRect(x, y, basemap_rect.width(), basemap_rect.height())
             painter.drawPixmap(target_rect, self.basemap_pixmap)
-        else:
-            # Fill background with black if no basemap (nodata areas will show as black)
-            painter.fillRect(self.rect(), QColor(0, 0, 0))
         
         # Draw hillshade layer (if available) - middle layer (underlay) at full opacity
         if self.show_hillshade and not self.hillshade_pixmap.isNull():
@@ -1081,8 +1104,6 @@ class MapWidget(QWidget):
         # Only this layer uses the opacity setting and blend mode
         if not self.current_pixmap.isNull():
             pixmap_rect = self.current_pixmap.rect()
-            
-            # Center the pixmap in the widget
             x = (widget_rect.width() - pixmap_rect.width()) // 2
             y = (widget_rect.height() - pixmap_rect.height()) // 2
             target_rect = QRect(x, y, pixmap_rect.width(), pixmap_rect.height())
@@ -1099,9 +1120,8 @@ class MapWidget(QWidget):
             # Reset opacity and composition mode for subsequent drawing
             painter.setOpacity(1.0)
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-        elif not self.show_basemap:
-            # Draw placeholder only if basemap is not shown
-            painter.fillRect(self.rect(), QColor(0, 0, 0))  # Black background
+        elif not self.show_basemap and not self.land_display_url:
+            # Draw placeholder only if no map layers are configured
             status_text = "Loading map..."
             if hasattr(self, 'loader') and self.loader and self.loader.isRunning():
                 status_text = "Loading map..."
