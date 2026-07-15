@@ -201,6 +201,9 @@ class MainWindow(QMainWindow):
         self.output_directory = None  # Store selected output directory
         self.config_file = "worldbathy_downloader_config.json"  # Config file path
         self._data_source_changing = False  # Flag to track when data source is changing
+        self._zoom_history = []
+        self._zoom_history_index = -1
+        self._zoom_history_suppress = False
         
         self.init_ui()
         self.load_config()  # Load saved output directory
@@ -239,6 +242,12 @@ class MainWindow(QMainWindow):
         map_controls.addWidget(self.aoi_checkbox)
         
         # Buttons (to the right of checkboxes)
+        self.zoom_back_btn = QPushButton("Zoom Prev")
+        self.zoom_back_btn.clicked.connect(self.zoom_back)
+        self.zoom_back_btn.setEnabled(False)
+        self.zoom_next_btn = QPushButton("Zoom Next")
+        self.zoom_next_btn.clicked.connect(self.zoom_next)
+        self.zoom_next_btn.setEnabled(False)
         self.fit_extent_btn = QPushButton("Zoom to Full Extent")
         self.fit_extent_btn.clicked.connect(self.fit_to_extent)
         self.clear_selection_btn = QPushButton("Clear Selection")
@@ -247,6 +256,8 @@ class MainWindow(QMainWindow):
         self.refresh_map_btn.clicked.connect(self.refresh_map)
         self.save_map_btn = QPushButton("Save Map to PNG")
         self.save_map_btn.clicked.connect(self.export_map_image)
+        map_controls.addWidget(self.zoom_back_btn)
+        map_controls.addWidget(self.zoom_next_btn)
         map_controls.addWidget(self.fit_extent_btn)
         map_controls.addWidget(self.clear_selection_btn)
         map_controls.addWidget(self.refresh_map_btn)
@@ -648,7 +659,7 @@ class MainWindow(QMainWindow):
                     # This recalculates the extent with padding and positions the box correctly
                     # Don't reload first - zoom_to_selection will reload with the correct extent
                     # Wait a bit longer to ensure widget is fully sized
-                    QTimer.singleShot(300, lambda: self.zoom_to_selection(*self.service_extent))
+                    QTimer.singleShot(300, lambda: self.zoom_to_selection(*self.service_extent, record_history=False))
             elif not self.map_widget.map_loaded and not getattr(self.map_widget, '_loading', False):
                 self.log_message("Map not loaded yet, will load and zoom to REST endpoint extent...")
                 # Map hasn't loaded yet - use zoom_to_selection which will load the map with correct extent
@@ -657,7 +668,7 @@ class MainWindow(QMainWindow):
                 # 2. Set map widget extent
                 # 3. Call load_map() to reload basemap and raster layers
                 # Wait a bit longer to ensure widget is fully sized
-                QTimer.singleShot(300, lambda: self.zoom_to_selection(*self.service_extent))
+                QTimer.singleShot(300, lambda: self.zoom_to_selection(*self.service_extent, record_history=False))
             else:
                 self.log_message("Map already loaded with REST endpoint extent")
         else:
@@ -759,6 +770,7 @@ class MainWindow(QMainWindow):
                 self.map_widget.selectionChanged.connect(self.on_selection_changed)
                 self.map_widget.selectionCompleted.connect(self.on_selection_completed)
                 self.map_widget.mapFirstLoaded.connect(self.on_map_first_loaded)
+                self.map_widget.userViewChanged.connect(self._on_user_map_view_changed)
                 self.map_widget.statusMessage.connect(self.log_message)  # Connect status messages to log
                 layout.addWidget(self.map_widget)
                 self.map_widget.show()
@@ -803,6 +815,117 @@ class MainWindow(QMainWindow):
             self.zoom_to_selection(*self.service_extent)
             # Update coordinate display to show the service extent
             self.update_coordinate_display(*self.service_extent, update_map=False)
+
+    def _current_zoom_state(self):
+        """Return the current map view extent and AOI as a history snapshot."""
+        if not self.map_widget:
+            return None
+        extent = self.map_widget._requested_extent or self.map_widget.extent
+        if extent is None:
+            return None
+        aoi = self.map_widget.selected_bbox_world
+        if aoi is not None:
+            aoi = tuple(aoi)
+        return (tuple(extent), aoi)
+
+    def _seed_zoom_history(self):
+        """Initialize zoom history with the current map state."""
+        state = self._current_zoom_state()
+        if state is None:
+            return
+        self._zoom_history = [state]
+        self._zoom_history_index = 0
+        self._update_zoom_nav_buttons()
+
+    def _append_zoom_history(self):
+        """Record the current map state in zoom history."""
+        if self._zoom_history_suppress or not self.map_widget:
+            return
+        state = self._current_zoom_state()
+        if state is None:
+            return
+        if (
+            self._zoom_history
+            and 0 <= self._zoom_history_index < len(self._zoom_history)
+            and self._zoom_history[self._zoom_history_index] == state
+        ):
+            return
+        self._zoom_history = self._zoom_history[: self._zoom_history_index + 1]
+        self._zoom_history.append(state)
+        self._zoom_history_index = len(self._zoom_history) - 1
+        self._update_zoom_nav_buttons()
+
+    def _reset_zoom_history(self):
+        """Clear zoom history (e.g. after switching data source)."""
+        self._zoom_history = []
+        self._zoom_history_index = -1
+        self._update_zoom_nav_buttons()
+
+    def _update_zoom_nav_buttons(self):
+        """Enable Zoom Prev/Next based on the current position in history."""
+        if hasattr(self, "zoom_back_btn"):
+            self.zoom_back_btn.setEnabled(self._zoom_history_index > 0)
+        if hasattr(self, "zoom_next_btn"):
+            self.zoom_next_btn.setEnabled(
+                0 <= self._zoom_history_index < len(self._zoom_history) - 1
+            )
+
+    def _apply_zoom_state(self, state):
+        """Restore a saved map view extent and AOI without recording history."""
+        if not self.map_widget:
+            return
+        extent, aoi = state
+        self._zoom_history_suppress = True
+        try:
+            self.map_widget.extent = extent
+            self.map_widget._requested_extent = extent
+            self.map_widget.selection_start = None
+            self.map_widget.selection_end = None
+            self.map_widget.is_selecting = False
+            if aoi:
+                self.map_widget.selected_bbox_world = tuple(aoi)
+                self.map_widget.set_selection_validity(True)
+                self.selected_bbox = tuple(aoi)
+                self.update_coordinate_display(*aoi, update_map=False)
+            else:
+                self.map_widget.selected_bbox_world = None
+                self.selected_bbox = None
+                self._updating_coordinates = True
+                try:
+                    for field in self._coordinate_fields:
+                        field.clear()
+                finally:
+                    self._updating_coordinates = False
+            self.map_widget.load_map()
+        finally:
+            self._zoom_history_suppress = False
+        self.check_and_update_download_button()
+        self._update_zoom_nav_buttons()
+
+    def _on_user_map_view_changed(self):
+        """Record map wheel/pan changes in zoom history."""
+        if self._zoom_history_suppress:
+            return
+        aoi = self.map_widget.selected_bbox_world if self.map_widget else None
+        self.selected_bbox = tuple(aoi) if aoi else None
+        if not self._zoom_history:
+            self._seed_zoom_history()
+        else:
+            self._append_zoom_history()
+
+    def zoom_back(self):
+        """Restore the previous map view and AOI."""
+        if self._zoom_history_index <= 0:
+            return
+        self._zoom_history_index -= 1
+        self._apply_zoom_state(self._zoom_history[self._zoom_history_index])
+
+    def zoom_next(self):
+        """Move forward to the next map view and AOI in history."""
+        if self._zoom_history_index >= len(self._zoom_history) - 1:
+            return
+        self._zoom_history_index += 1
+        self._apply_zoom_state(self._zoom_history[self._zoom_history_index])
             
     def clear_selection(self):
         """Clear the map selection."""
@@ -1345,7 +1468,7 @@ class MainWindow(QMainWindow):
             min(ymax, bymax),
         )
 
-    def zoom_to_selection(self, xmin, ymin, xmax, ymax):
+    def zoom_to_selection(self, xmin, ymin, xmax, ymax, record_history=True):
         """Zoom map to the selected area."""
         if self.map_widget:
             # Get widget aspect ratio - ensure widget is properly sized
@@ -1355,7 +1478,12 @@ class MainWindow(QMainWindow):
             # If widget isn't sized yet, wait a bit and try again
             if widget_width <= 0 or widget_height <= 0:
                 self.log_message(f"Widget not sized yet ({widget_width}x{widget_height}), retrying zoom_to_selection in 200ms...")
-                QTimer.singleShot(200, lambda: self.zoom_to_selection(xmin, ymin, xmax, ymax))
+                QTimer.singleShot(
+                    200,
+                    lambda x=xmin, y=ymin, X=xmax, Y=ymax, rh=record_history: self.zoom_to_selection(
+                        x, y, X, Y, record_history=rh
+                    ),
+                )
                 return
 
             service_extent = self._get_service_extent()
@@ -1413,11 +1541,19 @@ class MainWindow(QMainWindow):
             # Store the selected bbox in world coordinates for drawing (original selection, no modifications)
             # This is what will be shown in the yellow/green box and used for download
             self.map_widget.selected_bbox_world = (xmin, ymin, xmax, ymax)
+            self.selected_bbox = (xmin, ymin, xmax, ymax)
             # Ensure service_extent is preserved
             if not hasattr(self.map_widget, 'service_extent') or self.map_widget.service_extent is None:
                 self.map_widget.service_extent = self.service_extent
             # Don't clear selection - keep it visible
             self.map_widget.load_map()
+
+            if not self._zoom_history:
+                self._seed_zoom_history()
+            elif record_history and not self._zoom_history_suppress:
+                self._append_zoom_history()
+            else:
+                self._update_zoom_nav_buttons()
             
     def start_download(self):
         """Start downloading the selected area. Bbox is always in GCS (4326)."""
@@ -1720,7 +1856,7 @@ class MainWindow(QMainWindow):
                 xmin, ymin, xmax, ymax = self.map_widget.selected_bbox_world
                 # Zoom to the selection - this will recalculate the extent based on new widget size
                 # making the selection box appear the same visual size
-                self.zoom_to_selection(xmin, ymin, xmax, ymax)
+                self.zoom_to_selection(xmin, ymin, xmax, ymax, record_history=False)
             else:
                 # No selection - just reload the map with current extent
                 self.map_widget.load_map()
@@ -1812,7 +1948,7 @@ class MainWindow(QMainWindow):
                 # CRITICAL: Zoom to the REST endpoint bounds using zoom_to_selection
                 # This ensures the map extent is recalculated with padding and the box is positioned correctly
                 # This mimics what happens when the user hits return in a coordinate field
-                QTimer.singleShot(300, lambda: self.zoom_to_selection(*self.service_extent))
+                QTimer.singleShot(300, lambda: self.zoom_to_selection(*self.service_extent, record_history=False))
                 self.log_message("Default selection set to service extent bounds, will zoom to dataset bounds")
         # Show map interaction instructions once when map first loads (in orange)
         self.log_message(
@@ -1831,7 +1967,7 @@ class MainWindow(QMainWindow):
             self.map_widget.service_extent = self.service_extent
             
             # Zoom to the service extent - this will reload the map with the correct extent
-            self.zoom_to_selection(*self.service_extent)
+            self.zoom_to_selection(*self.service_extent, record_history=False)
             # After zoom completes, the map will reload and the box should be visible
             # The box will be repainted in paintEvent when the new map loads
         
@@ -1894,6 +2030,7 @@ class MainWindow(QMainWindow):
             saved_selection = self.selected_bbox
         
         # Update current data source
+        self._reset_zoom_history()
         self.current_data_source = data_source_name
         self.base_url = self.data_sources[data_source_name]["url"]
         self.service_extent = new_service_extent
@@ -1996,7 +2133,7 @@ class MainWindow(QMainWindow):
                 self.map_widget.set_selection_validity(True)
             
             # Zoom to the selection to maintain visual size
-            self.zoom_to_selection(bbox[0], bbox[1], bbox[2], bbox[3])
+            self.zoom_to_selection(bbox[0], bbox[1], bbox[2], bbox[3], record_history=False)
             
             # Update coordinate displays (without updating map since zoom_to_selection already does)
             self.update_coordinate_display(bbox[0], bbox[1], bbox[2], bbox[3], update_map=False)

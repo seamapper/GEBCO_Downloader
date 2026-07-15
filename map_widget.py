@@ -284,6 +284,7 @@ class MapWidget(QWidget):
     selectionCompleted = pyqtSignal(float, float, float, float)  # xmin, ymin, xmax, ymax - emitted when selection is finished
     mapFirstLoaded = pyqtSignal()  # Emitted when map is successfully loaded for the first time
     statusMessage = pyqtSignal(str)  # Emit status/log messages
+    userViewChanged = pyqtSignal()  # Emitted after user pan/wheel changes the map view
     
     def set_selection_validity(self, is_valid):
         """Set whether the current selection is within size limits."""
@@ -1019,6 +1020,7 @@ class MapWidget(QWidget):
             self.pan_origin = None
             self.pan_end = None
             self.update()  # Clear pan line
+            self.userViewChanged.emit()
             
     def wheelEvent(self, event):
         """Handle mouse wheel for zooming."""
@@ -1064,7 +1066,8 @@ class MapWidget(QWidget):
         self._load_timer.setSingleShot(True)
         self._load_timer.timeout.connect(self.load_map)
         self._load_timer.start(300)  # Wait 300ms before loading (debounce)
-        
+        self.userViewChanged.emit()
+            
     def resizeEvent(self, event):
         """Handle widget resize."""
         super().resizeEvent(event)
